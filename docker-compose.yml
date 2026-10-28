@@ -1,0 +1,29 @@
+services:
+  target:
+    build:
+      context: ./target
+    image: php2leak-target:8.4.26
+    container_name: php2leak-target
+    networks:
+      - php2leak
+    # Stock Apache prefork MPM: the exploit pins the worker via keep-alive.
+    stop_grace_period: 2s
+
+  attacker:
+    build:
+      context: ./attacker
+    image: php2leak-attacker:latest
+    container_name: php2leak-attacker
+    networks:
+      - php2leak
+    depends_on:
+      - target
+    environment:
+      TARGET_HOST: target
+      TARGET_PORT: "80"
+    tty: true
+    stdin_open: true
+
+networks:
+  php2leak:
+    driver: bridge
