@@ -1,5 +1,7 @@
 # php2leak — remote ASLR leak (heap)
 
+Full article about php2shell available [here](https://dguerri.github.io/random-tech-stuff/posts/anatomy-of-php2shell-cve-2026-109618-and-cve-2026-109619/)
+
 A Docker testbed that reproduces the **ASLR-leak** possible due to
 CVE-2026-109618 / CVE-2026-109619 on a vulnerable **PHP 8.4.26 + Apache
 `mod_php` (prefork)** build, and **leaks the Zend MM heap base (an
